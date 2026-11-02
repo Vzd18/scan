@@ -66,7 +66,19 @@ function normalize(raw) {
   var s = String(raw || '').replace(/[\r\n]+$/g, '');
   s = s.replace(/^\][A-Za-z][0-9A-Za-z]/, '');  // префикс идентификатора символики, если есть
   s = s.replace(/^\x1d+/, '').replace(/\x1d+$/, '');  // GS в начале (FNC1) и в конце не храним
+  if (/^\(01\)\d{14}\(21\)/.test(s)) s = fromHri(s);
   return s;
+}
+// Запасной распознаватель (iPhone) может вернуть текст со скобками: (01)GTIN(21)серия(91)..(92)..
+// Собираем обратно «сырой» код: после серийного номера (21) перед каждой следующей частью ставим GS.
+function fromHri(s) {
+  var p = s.split(/\((\d{2,4})\)/);  // ['', '01', gtin, '21', serial, '91', x, ...]
+  var out = '';
+  for (var i = 1; i < p.length; i += 2) {
+    if (i > 3) out += GS;
+    out += p[i] + p[i + 1];
+  }
+  return out;
 }
 // Код маркировки Честного знака: 01 + GTIN(14) + 21 + серийный номер ...
 function isMarking(s) { return /^01\d{14}21[\x21-\x7e]{3,}/.test(s); }
@@ -149,16 +161,30 @@ function loop() {
   }
 }
 
-function startCamera() {
-  if (!('BarcodeDetector' in window)) {
-    msgEl.textContent = 'Этот браузер не умеет распознавать коды. Откройте страницу в Chrome на Android.';
-    return;
-  }
+// Встроенный распознаватель Chrome (Android); если его нет (iPhone) — запасной на WebAssembly из папки сайта
+function makeDetector() {
   var fmts = ['data_matrix', 'qr_code'];
-  BarcodeDetector.getSupportedFormats().then(function (sup) {
-    fmts = fmts.filter(function (f) { return sup.indexOf(f) !== -1; });
-    if (!fmts.length) { msgEl.textContent = 'В этом браузере нет поддержки Data Matrix и QR.'; return; }
-    detector = new BarcodeDetector({ formats: fmts });
+  var native = Promise.resolve(false);
+  if ('BarcodeDetector' in window) {
+    native = BarcodeDetector.getSupportedFormats().then(function (sup) {
+      return sup.indexOf('data_matrix') !== -1 && sup.indexOf('qr_code') !== -1;
+    }).catch(function () { return false; });
+  }
+  return native.then(function (ok) {
+    if (ok) return new BarcodeDetector({ formats: fmts });
+    var API = window.BarcodeDetectionAPI;
+    if (!API) throw new Error('распознаватель не загружен');
+    API.prepareZXingModule({
+      overrides: { locateFile: function (path, prefix) { return path.slice(-5) === '.wasm' ? 'zxing_reader.wasm' : prefix + path; } },
+      fireImmediately: true
+    });
+    return new API.BarcodeDetector({ formats: fmts });
+  });
+}
+
+function startCamera() {
+  makeDetector().then(function (d) {
+    detector = d;
     return navigator.mediaDevices.getUserMedia({
       audio: false,
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
@@ -176,7 +202,8 @@ function startCamera() {
       if (cap.focusMode && cap.focusMode.indexOf('continuous') !== -1) adv.push({ focusMode: 'continuous' });
       if (adv.length) track.applyConstraints({ advanced: adv });
       btnTorch.disabled = !cap.torch;
-    } catch (e) {}
+      if (!cap.torch) btnTorch.style.display = 'none';
+    } catch (e) { btnTorch.style.display = 'none'; }
     scanning = true; setStatus('Наведите камеру на код'); keepAwake(); loop();
   }).catch(function (e) {
     msgEl.textContent = 'Камера не включилась: ' + (e && e.message ? e.message : e);
