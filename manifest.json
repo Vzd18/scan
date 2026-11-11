@@ -1,6 +1,6 @@
 {
-  "name": "Сканер кодов",
-  "short_name": "Сканер",
+  "name": "Сканер 2",
+  "short_name": "Сканер 2",
   "start_url": "./index.html",
   "display": "standalone",
   "orientation": "portrait",

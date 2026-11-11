@@ -29,7 +29,9 @@ try { journal = JSON.parse(localStorage.getItem(JOURNAL) || '[]'); } catch (e) {
 })();
 function saveJournal() { try { localStorage.setItem(JOURNAL, JSON.stringify(journal)); } catch (e) {} }
 
-function save() { try { localStorage.setItem(STORE, JSON.stringify(codes)); } catch (e) {} }
+function storeKey(c) { return c === 'nvk' ? 'scanner.codes.nvk.v1' : (c === 'prih' ? 'scanner.codes.prih.v1' : STORE); }
+function loadCodes(c) { try { return JSON.parse(localStorage.getItem(storeKey(c)) || '[]'); } catch (e) { return []; } }
+function save() { try { localStorage.setItem(storeKey(chan), JSON.stringify(codes)); } catch (e) {} }
 
 // ---------- звук и вибрация ----------
 function beep(kind) {
@@ -52,8 +54,16 @@ function setStatus(text, cls, sub, warn) {
   var big = document.createElement('div'); big.className = 'big'; big.textContent = text;
   statusEl.appendChild(big);
   (sub ? [].concat(sub) : []).forEach(function (t, i) {
-    var d = document.createElement('div'); d.className = 'small' + (warn && i === 0 ? ' warn' : '');
-    d.textContent = t; statusEl.appendChild(d);
+    // элемент может быть строкой или объектом {t: текст, c: доп. класс}; name — строка наименования товара
+    var extra = (t && typeof t === 'object') ? (' ' + t.c) : '';
+    var d = document.createElement('div'); d.className = 'small' + (warn && i === 0 ? ' warn' : '') + extra;
+    if (t && typeof t === 'object') {
+      if (t.k) { var k = document.createElement('span'); k.className = 'kod'; k.textContent = t.k + ' '; d.appendChild(k); }
+      d.appendChild(document.createTextNode(t.t));
+    } else {
+      d.textContent = t;
+    }
+    statusEl.appendChild(d);
   });
 }
 function fmtWhen(t) {
@@ -91,7 +101,14 @@ function render() {
     var b = document.createElement('b'); b.textContent = (i + 1) + '.';
     var t = document.createElement('span');
     t.textContent = c.split(GS).join('␝');
-    li.appendChild(b); li.appendChild(t);
+    var box = document.createElement('div'); box.style.flex = '1';
+    var p = productOf(c);
+    if (p) {
+      var nm = document.createElement('div'); nm.className = 'pname'; nm.textContent = (p.kod ? p.kod + ' ' : '') + p.name;
+      box.appendChild(nm);
+    }
+    box.appendChild(t);
+    li.appendChild(b); li.appendChild(box);
     listEl.appendChild(li);
   });
   var n = codes.length;
@@ -117,12 +134,20 @@ function addCode(raw) {
   }
   var prev = null;
   for (var k = journal.length - 1; k >= 0; k--) { if (journal[k].c === s) { prev = journal[k]; break; } }
+  // ТЧек: предыдущий заказ уже принят кассой — следующий код начинает новый заказ
+  var startedNew = false;
+  if (!cfg.warehouse && chan === 'tchek' && order && order.status === 'acked') {
+    codes = []; save(); order = null; saveOrder(); startedNew = true;
+  }
   codes.push(s); save();
-  journal.push({ t: Date.now(), c: s }); saveJournal();
+  var prod = productOf(s);
+  journal.push({ t: Date.now(), c: s, n: prod ? prod.name : '', k: prod ? prod.kod : '', p: procLabel() }); saveJournal();
   render(); beep('ok');
   var sub = [];
-  if (prev) sub.push('Этот код уже сканировали: ' + fmtWhen(prev.t));
+  if (prev) sub.push('Этот код уже сканировали: ' + fmtWhen(prev.t) + ' (' + (prev.p || 'ТЧек') + ')');
+  sub.push(prod ? { t: prod.name, k: prod.kod, c: 'name' } : { t: 'Не найден в справочнике: GTIN ' + gtinOf(s), c: 'name' });
   sub.push(s.slice(0, 34).split(GS).join('\u241d'));
+  if (startedNew) sub.push('Начат новый заказ');
   setStatus('Принят № ' + codes.length, 'ok', sub, !!prev);
 }
 
@@ -235,6 +260,8 @@ function drawCode() {
   var c = codes[viewIndex];
   var next = MODES[(MODES.indexOf(viewMode) + 1) % MODES.length];
   el('vinfo').textContent = (viewIndex + 1) + ' из ' + codes.length + '  (' + MODE_NAMES[viewMode] + ')';
+  var vp = productOf(c);
+  el('vname').textContent = vp ? vp.name : '';
   el('vtxt').textContent = c.split(GS).join('\u241d');
   el('vPrev').disabled = viewIndex === 0;
   el('vNext').disabled = viewIndex >= codes.length - 1;
@@ -267,11 +294,17 @@ btnTorch.addEventListener('click', toggleTorch);
 btnShow.addEventListener('click', openViewer);
 btnUndo.addEventListener('click', function () {
   var last = codes.pop(); save();
-  for (var i = journal.length - 1; i >= 0; i--) { if (journal[i].c === last) { journal.splice(i, 1); break; } }
+  for (var i = journal.length - 1; i >= 0; i--) { if (journal[i].c === last && (journal[i].p || 'ТЧек') === procLabel()) { journal.splice(i, 1); break; } }
   saveJournal(); render();
 });
 btnClear.addEventListener('click', function () {
-  if (confirm('Удалить все ' + codes.length + ' кодов из списка?')) { codes = []; save(); render(); }
+  var msg = 'Удалить все ' + codes.length + ' кодов из списка?';
+  if (!cfg.warehouse && chan === 'tchek' && order && order.status === 'new') msg = 'Список передан на кассу и ещё не принят. Всё равно очистить?';
+  if (confirm(msg)) {
+    codes = []; save();
+    if (!cfg.warehouse && chan === 'tchek') { order = null; saveOrder(); }
+    render();
+  }
 });
 el('vPrev').addEventListener('click', function () { if (viewIndex > 0) { viewIndex--; drawCode(); } });
 el('vNext').addEventListener('click', function () { if (viewIndex < codes.length - 1) { viewIndex++; drawCode(); } });
@@ -301,12 +334,15 @@ function updateJournalInfo() {
 }
 
 function buildCsv(key) {
-  var rows = ['Дата;Время;№;Код (разделители показаны как ␝);Код (как есть, с разделителями GS)'];
+  var rows = ['Дата;Время;№;Процесс;Код (разделители показаны как ␝);Код (как есть, с разделителями GS);Код 1С8;Наименование'];
   dayEntries(key).forEach(function (j, i) {
     var d = new Date(j.t);
     var tm = pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
     var vis = j.c.split(GS).join('\u241d');
-    rows.push([key, tm, i + 1, '"' + vis.replace(/"/g, '""') + '"', '"' + j.c.replace(/"/g, '""') + '"'].join(';'));
+    var pp = productOf(j.c);
+    var pn = j.n || (pp ? pp.name : '');
+    var pk = j.k || (pp ? pp.kod : '');
+    rows.push([key, tm, i + 1, (j.p || 'ТЧек'), '"' + vis.replace(/"/g, '""') + '"', '"' + j.c.replace(/"/g, '""') + '"', '"' + pk.replace(/"/g, '""') + '"', '"' + pn.replace(/"/g, '""') + '"'].join(';'));
   });
   return '\ufeff' + rows.join('\r\n') + '\r\n';
 }
@@ -344,3 +380,272 @@ el('jDate').addEventListener('change', updateJournalInfo);
 el('jShare').addEventListener('click', shareFile);
 el('jSave').addEventListener('click', saveFile);
 el('jClose').addEventListener('click', function () { el('jrn').classList.remove('on'); });
+
+// ---------- отправка заказа на кассу (очередь на сервере) ----------
+var CFG = 'scanner.cfg.v1', ORDER = 'scanner.order.v1';
+var cfg = { url: 'https://194-190-153-224.sslip.io:8444', token: '', seller: '', warehouse: false }, order = null, pollTimer = null;
+var btnSend = el('btnSend');
+try { cfg = Object.assign(cfg, JSON.parse(localStorage.getItem(CFG) || '{}')); } catch (e) {}
+try { order = JSON.parse(localStorage.getItem(ORDER) || 'null'); } catch (e) { order = null; }
+function saveOrder() { try { localStorage.setItem(ORDER, JSON.stringify(order)); } catch (e) {} }
+
+// ---------- процессы (вкладки) ----------
+// Продавец: ТЧек (с отправкой на кассу 1С8) и НВК (накладная 1С7, без отправки).
+// Склад (галочка в настройках): НВК и Приходы, без отправки на кассу.
+var CHK = 'scanner.ch.v1';
+var CH_LABEL = { tchek: 'ТЧек', nvk: 'НВК', prih: 'Приходы' };
+function tabsFor() { return cfg.warehouse ? ['nvk', 'prih'] : ['tchek', 'nvk']; }
+var chan = 'tchek';
+try { chan = localStorage.getItem(CHK) || 'tchek'; } catch (e) {}
+if (tabsFor().indexOf(chan) === -1) chan = tabsFor()[0];
+codes = loadCodes(chan);
+
+function procLabel() { return CH_LABEL[chan] || 'ТЧек'; }
+function countOf(c) { return c === chan ? codes.length : loadCodes(c).length; }
+function updateTabs() {
+  var ts = tabsFor(), btns = [el('tabT'), el('tabN')];
+  ts.forEach(function (c, i) {
+    var n = countOf(c);
+    btns[i].textContent = CH_LABEL[c] + (n ? ' · ' + n : '');
+    btns[i].classList.toggle('on', chan === c);
+  });
+}
+function setChannel(c) {
+  if (tabsFor().indexOf(c) === -1 || c === chan) return;
+  save(); chan = c;
+  try { localStorage.setItem(CHK, c); } catch (e) {}
+  codes = loadCodes(c); lastSeen = {};
+  el('viewer').classList.remove('on');
+  render();
+  setStatus('Процесс: ' + procLabel());
+}
+el('tabT').addEventListener('click', function () { setChannel(tabsFor()[0]); });
+el('tabN').addEventListener('click', function () { setChannel(tabsFor()[1]); });
+
+function orderLine(text, cls) { var o = el('orderInfo'); o.textContent = text; o.className = cls || ''; }
+
+// Режим склада: кнопка «Отправить на кассу» скрыта, вкладки НВК и Приходы; строка статуса заказа пуста
+function applyMode() {
+  btnSend.style.display = cfg.warehouse ? 'none' : '';
+  el('btnNew').style.display = 'none';   // вместо «Нов Скан» — вкладки и «Очистить всё»
+  el('tabs').style.display = '';
+  el('bar3').style.justifyContent = cfg.warehouse ? 'flex-end' : '';
+}
+
+function showOrder() {
+  applyMode();
+  if (cfg.warehouse) { orderLine('', ''); return; }
+  if (chan === 'nvk') { btnSend.disabled = true; orderLine('', ''); return; }
+  btnSend.disabled = codes.length === 0;
+  if (!order) { orderLine(codes.length ? 'Не отправлено на кассу' : '', codes.length ? 'wait' : ''); return; }
+  if (order.status === 'cancelled') { orderLine('Заказ № ' + order.id + ' отменён', 'bad'); return; }
+  if (order.status === 'acked') orderLine('Заказ № ' + order.id + ': принят кассой (' + order.count + ' шт.)', 'ok');
+  else orderLine('Заказ № ' + order.id + ': передан, ждёт кассу (' + order.count + ' шт.)', 'wait');
+}
+
+function api(method, path, body) {
+  var opts = { method: method, headers: { 'X-Auth-Token': cfg.token } };
+  if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  return fetch(cfg.url.replace(/\/+$/, '') + path, opts).then(function (r) {
+    return r.json().catch(function () { return {}; }).then(function (j) {
+      if (!r.ok) { var err = new Error(j.error || ('HTTP ' + r.status)); err.status = r.status; throw err; }
+      return j;
+    });
+  });
+}
+
+function poll() {
+  clearTimeout(pollTimer);
+  if (cfg.warehouse || !order || order.status === 'acked' || !cfg.url) return;
+  api('GET', '/api/orders/' + order.id).then(function (j) {
+    if (j.status === 'acked') { order.status = 'acked'; saveOrder(); showOrder(); beep('ok'); return; }
+    if (j.status === 'cancelled') { order.status = 'cancelled'; saveOrder(); showOrder(); return; }
+    pollTimer = setTimeout(poll, 5000);
+  }).catch(function () { pollTimer = setTimeout(poll, 10000); });
+}
+
+function sendOrder() {
+  if (cfg.warehouse) return;
+  if (chan !== 'tchek') return;
+  if (!cfg.url || !cfg.token) { askPin(); return; }
+  if (!codes.length) return;
+  var sig = codes.join('\n');
+  // тот же список уже передан или принят кассой — повторно не отправляем
+  if (order && order.sig === sig && order.status !== 'cancelled') {
+    beep('dup');
+    orderLine(order.status === 'acked'
+      ? 'Этот список уже принят кассой (заказ № ' + order.id + '). Следующий отсканированный код начнёт новый заказ.'
+      : 'Уже передано: заказ № ' + order.id + ', ждёт кассу.', 'wait');
+    return;
+  }
+  // заказ уже принят кассой — дополнять его нельзя
+  if (order && order.status === 'acked') {
+    beep('bad');
+    orderLine('Заказ № ' + order.id + ' уже принят кассой. Следующий отсканированный код начнёт новый заказ.', 'bad');
+    return;
+  }
+  // заказ передан, но не принят, а список изменился — предлагаем заменить
+  var replace = order && order.status === 'new';
+  if (replace && !confirm('Заказ № ' + order.id + ' ещё не принят кассой. Заменить его новым списком из ' + codes.length + ' кодов?')) return;
+  btnSend.disabled = true; orderLine('Отправляю…', 'wait');
+  var prev = replace ? api('POST', '/api/orders/' + order.id + '/cancel').catch(function (e) {
+    if (e && e.status === 409) throw new Error('старый заказ № ' + order.id + ' уже принят кассой, обновите страницу');
+    throw e;
+  }) : Promise.resolve();
+  prev.then(function () {
+    return api('POST', '/api/orders', { seller: cfg.seller, codes: codes });
+  }).then(function (j) {
+    order = { id: j.id, status: 'new', count: j.count || codes.length, sig: sig };
+    saveOrder(); showOrder(); beep('ok'); poll();
+  }).catch(function (e) {
+    btnSend.disabled = false;
+    orderLine('Не отправлено: ' + (e && e.message ? e.message : e) + '. Список сохранён, можно повторить.', 'bad');
+    beep('bad');
+  });
+}
+
+function newOrder() {
+  if (cfg.warehouse) {
+    if (codes.length && !confirm('Очистить список ' + codes.length + ' кодов и начать новый заказ?')) return;
+  } else if (codes.length && (!order || order.status !== 'acked')) {
+    if (!confirm('Список не принят кассой. Всё равно начать новый заказ и очистить список?')) return;
+  }
+  codes = []; save(); order = null; saveOrder(); render(); showOrder();
+}
+
+// ---------- PIN на настройки ----------
+var PINK = 'scanner.pin.v1';
+function pinHash(p) { var h = 5381, s = 'scan2|' + p; for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return String(h >>> 0); }
+function pinSet() { try { return localStorage.getItem(PINK) || ''; } catch (e) { return ''; } }
+function askPin() {
+  if (!pinSet()) { openCfg(); return; }
+  el('pIn').value = ''; el('pErr').textContent = ''; el('pinm').classList.add('on');
+  setTimeout(function () { try { el('pIn').focus(); } catch (e) {} }, 60);
+}
+el('pOk').addEventListener('click', function () {
+  if (pinHash(el('pIn').value.trim()) === pinSet()) { el('pinm').classList.remove('on'); openCfg(); }
+  else { el('pErr').textContent = 'Неверный PIN'; el('pIn').value = ''; beep('bad'); }
+});
+el('pCancel').addEventListener('click', function () { el('pinm').classList.remove('on'); });
+el('cPinDel').addEventListener('click', function () {
+  if (!confirm('Убрать PIN с настроек?')) return;
+  try { localStorage.removeItem(PINK); } catch (e) {}
+  el('cPinDel').style.display = 'none';
+});
+
+function cfgVisibility() { el('cSrv').style.display = el('cWh').checked ? 'none' : ''; }
+function openCfg() {
+  el('cUrl').value = cfg.url; el('cToken').value = cfg.token; el('cSeller').value = cfg.seller;
+  el('cWh').checked = !!cfg.warehouse; cfgVisibility();
+  el('cPin').value = ''; el('cPinDel').style.display = pinSet() ? '' : 'none';
+  catInfo(); el('cfgm').classList.add('on');
+}
+el('cWh').addEventListener('change', cfgVisibility);
+el('btnSend').addEventListener('click', sendOrder);
+el('btnNew').addEventListener('click', newOrder);
+el('btnCfg').addEventListener('click', askPin);
+el('cClose').addEventListener('click', function () { el('cfgm').classList.remove('on'); });
+el('cSave').addEventListener('click', function () {
+  var np = el('cPin').value.trim();
+  if (np) {
+    if (!/^\d{4}$/.test(np)) { alert('PIN: ровно 4 цифры'); return; }
+    try { localStorage.setItem(PINK, pinHash(np)); } catch (e) {}
+  }
+  var wasWh = !!cfg.warehouse;
+  cfg = { url: el('cUrl').value.trim(), token: el('cToken').value.trim(), seller: el('cSeller').value.trim(), warehouse: el('cWh').checked };
+  try { localStorage.setItem(CFG, JSON.stringify(cfg)); } catch (e) {}
+  // смена режима склада: возвращаемся на вкладку ТЧек и подгружаем её список
+  if (tabsFor().indexOf(chan) === -1) { save(); chan = tabsFor()[0]; try { localStorage.setItem(CHK, chan); } catch (e) {} codes = loadCodes(chan); }
+  el('cfgm').classList.remove('on'); render(); poll();
+});
+
+// обновляем строку заказа при любом изменении списка
+var _render = render;
+render = function () { _render(); showOrder(); updateTabs(); };
+render();
+poll();
+
+// ---------- справочник товаров: GTIN -> наименование (файл из 1С8, хранится в телефоне) ----------
+var CAT = 'scanner.cat.v1';
+var catalog = null;  // { k: { "<GTIN без ведущих нулей>": [код, наименование] }, n: число, t: время загрузки }
+try { catalog = JSON.parse(localStorage.getItem(CAT) || 'null'); } catch (e) { catalog = null; }
+
+function gtinOf(code) { var m = /^01(\d{14})/.exec(code || ''); return m ? m[1] : ''; }
+function productOf(code) {
+  var g = gtinOf(code);
+  if (!g || !catalog || !catalog.k) return null;
+  var r = catalog.k[g.replace(/^0+/, '')];
+  if (!r) return null;
+  // у штрихкода может быть несколько позиций: r = [код, наименование] или [[код, наименование], ...]
+  var list = (typeof r[0] === 'string') ? [r] : r;
+  if (list.length === 1) return { kod: list[0][0], name: list[0][1] };
+  return {
+    kod: list.map(function (x) { return x[0]; }).join(', '),
+    name: 'Варианты (' + list.length + '): ' + list.map(function (x) { return x[1]; }).join(' / ')
+  };
+}
+
+function decodeBytes(buf) {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+  catch (e) { return new TextDecoder('windows-1251').decode(buf); }
+}
+
+function splitLine(line, d) {
+  var out = [], cur = '', q = false;
+  for (var i = 0; i < line.length; i++) {
+    var ch = line[i];
+    if (q) { if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
+    else if (ch === '"') q = true;
+    else if (ch === d) { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+function parseCatalog(text) {
+  var lines = text.replace(/^\ufeff/, '').split(/\r?\n/).filter(function (l) { return l.trim(); });
+  if (!lines.length) throw new Error('файл пустой');
+  var first = lines[0], best = ';', bc = -1;
+  [';', '\t', ','].forEach(function (d) { var c = first.split(d).length; if (c > bc) { bc = c; best = d; } });
+  var k = {}, n = 0;
+  lines.forEach(function (l) {
+    var f = splitLine(l, best);
+    var bar = (f[0] || '').replace(/\D/g, '');
+    if (bar.length < 8) return;  // заголовок или мусор
+    var name = f.slice(2).join(best).trim();
+    if (!name) return;
+    var key = bar.replace(/^0+/, '');
+    var kod = (f[1] || '').trim();
+    if (!k[key]) { k[key] = [[kod, name]]; n++; return; }
+    var dup = k[key].some(function (x) { return x[0] === kod; });
+    if (!dup) k[key].push([kod, name]);
+  });
+  if (!n) throw new Error('не нашёл ни одной строки вида «штрихкод; код; наименование»');
+  return { k: k, n: n, t: Date.now() };
+}
+
+function catInfo() {
+  var i = el('cCatInfo');
+  if (!i) return;
+  i.textContent = catalog ? ('В справочнике ' + catalog.n + ' товаров, загружен ' + fmtWhen(catalog.t)) : 'Справочник не загружен';
+}
+
+el('cCat').addEventListener('change', function () {
+  var f = this.files && this.files[0];
+  if (!f) return;
+  var rd = new FileReader();
+  rd.onload = function () {
+    try {
+      var c = parseCatalog(decodeBytes(rd.result));
+      localStorage.setItem(CAT, JSON.stringify(c));
+      catalog = c; catInfo(); render();
+      el('cCatInfo').textContent += '. Готово.';
+    } catch (e) {
+      el('cCatInfo').textContent = 'Не загрузилось: ' + (e && e.message ? e.message : e);
+    }
+  };
+  rd.readAsArrayBuffer(f);
+});
+catInfo();
+render();
